@@ -1,0 +1,141 @@
+# app.py
+import gradio as gr
+import pandas as pd
+import plotly.express as px
+import datetime
+import io
+import openai
+import os
+
+# ------------------- CONFIG -------------------
+# Read API key from environment variable
+# Before running, set the environment variable OPENAI_API_KEY
+# e.g., in Colab: import os; os.environ["OPENAI_API_KEY"] = "your_api_key_here"
+openai.api_key = os.getenv("OPENAI_API_KEY")
+if openai.api_key is None:
+    raise ValueError("OPENAI_API_KEY environment variable not set.")
+
+# ------------------- HELPER FUNCTIONS -------------------
+
+def categorize_expense_gpt(description):
+    """Use GPT model to categorize uncategorized expense descriptions."""
+    prompt = f"Categorize this expense: '{description}' into one of the common categories like Food, Transport, Utilities, Entertainment, Health, Shopping, Others."
+    try:
+        response = openai.Completion.create(
+            model="text-davinci-003",
+            prompt=prompt,
+            temperature=0,
+            max_tokens=20
+        )
+        category = response.choices[0].text.strip()
+        return category if category else "Others"
+    except:
+        return "Others"
+
+def detect_anomalies(df):
+    """Flag unusually high expenses (greater than mean + 2*std)."""
+    threshold = df['Amount'].mean() + 2 * df['Amount'].std()
+    df['Anomaly'] = df['Amount'].apply(lambda x: "Yes" if x > threshold else "No")
+    return df
+
+def summarize_expenses(df):
+    """Generate a simple summary."""
+    total = df['Amount'].sum()
+    top_category = df.groupby('Category')['Amount'].sum().idxmax()
+    summary = f"Total Expenses: ${total:.2f}\nHighest Spending Category: {top_category}"
+    return summary
+
+def generate_visuals(df):
+    """Create Plotly charts for visualization."""
+    pie_chart = px.pie(df, names='Category', values='Amount', title='Expense Distribution by Category')
+    line_chart = px.line(df, x='Date', y='Amount', title='Expense Trends Over Time')
+    bar_chart = px.bar(df.groupby(['Date', 'Category'])['Amount'].sum().reset_index(), 
+                       x='Date', y='Amount', color='Category', title='Monthly Category-wise Comparison')
+    return pie_chart, line_chart, bar_chart
+
+def process_manual_input(name, category, amount, date):
+    """Process manual input and return full analysis."""
+    try:
+        date = pd.to_datetime(date)
+    except:
+        date = pd.to_datetime(datetime.date.today())
+    data = pd.DataFrame([{'Expense Name': name, 'Category': category, 'Amount': amount, 'Date': date}])
+    data['Category'] = data.apply(lambda row: categorize_expense_gpt(row['Expense Name']) if not row['Category'] else row['Category'], axis=1)
+    data = detect_anomalies(data)
+    summary = summarize_expenses(data)
+    pie, line, bar = generate_visuals(data)
+    return data, summary, pie, line, bar
+
+def process_file(file_obj):
+    """Process CSV or JSON file upload and return full analysis."""
+    if file_obj.name.endswith('.csv'):
+        df = pd.read_csv(file_obj.name)
+    elif file_obj.name.endswith('.json'):
+        df = pd.read_json(file_obj.name)
+    else:
+        return "Unsupported file format", None, None, None, None
+
+    df.columns = [c.strip() for c in df.columns]
+    if 'Category' not in df.columns:
+        df['Category'] = None
+    df['Category'] = df.apply(lambda row: categorize_expense_gpt(row['Expense Name']) if not row['Category'] else row['Category'], axis=1)
+    df['Date'] = pd.to_datetime(df['Date'])
+    df = detect_anomalies(df)
+    summary = summarize_expenses(df)
+    pie, line, bar = generate_visuals(df)
+    return df, summary, pie, line, bar
+
+def download_csv(df):
+    """Return CSV bytes for download."""
+    buffer = io.StringIO()
+    df.to_csv(buffer, index=False)
+    return buffer.getvalue()
+
+def process_file_and_return(file_obj):
+    df, summary, pie, line, bar = process_file(file_obj)
+    csv_data = download_csv(df)
+    return df, summary, pie, line, bar, csv_data
+
+# ------------------- GRADIO INTERFACE -------------------
+
+with gr.Blocks() as app:
+    gr.Markdown("## AI-Powered Expense Analyzer")
+    
+    # Manual Entry Tab
+    with gr.Tab("Manual Entry"):
+        name = gr.Textbox(label="Expense Name")
+        category = gr.Textbox(label="Category")
+        amount = gr.Number(label="Amount")
+        date = gr.Textbox(label="Date (YYYY-MM-DD)", placeholder="2025-11-18")
+        manual_btn = gr.Button("Analyze Expense")
+        manual_output_table = gr.Dataframe(headers=["Expense Name", "Category", "Amount", "Date", "Anomaly"])
+        manual_output_summary = gr.Textbox(label="Summary")
+        manual_output_pie = gr.Plot()
+        manual_output_line = gr.Plot()
+        manual_output_bar = gr.Plot()
+
+        manual_btn.click(
+            process_manual_input,
+            inputs=[name, category, amount, date],
+            outputs=[manual_output_table, manual_output_summary, manual_output_pie, manual_output_line, manual_output_bar]
+        )
+
+    # File Upload Tab
+    with gr.Tab("File Upload (CSV/JSON)"):
+        file_input = gr.File(label="Upload CSV or JSON")
+        file_btn = gr.Button("Analyze File")
+        file_output_table = gr.Dataframe(headers=["Expense Name", "Category", "Amount", "Date", "Anomaly"])
+        file_output_summary = gr.Textbox(label="Summary")
+        file_output_pie = gr.Plot()
+        file_output_line = gr.Plot()
+        file_output_bar = gr.Plot()
+        download_btn = gr.File(label="Download CSV", file_types=['.csv'])
+
+        file_btn.click(
+            process_file_and_return,
+            inputs=[file_input],
+            outputs=[file_output_table, file_output_summary, file_output_pie, file_output_line, file_output_bar, download_btn]
+        )
+
+# ------------------- LAUNCH -------------------
+app.launch()
